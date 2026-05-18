@@ -45,7 +45,8 @@ logger = logging.getLogger("rustchain_bot")
 # Config
 # ---------------------------------------------------------------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-RUSTCHAIN_API = os.getenv("RUSTCHAIN_API", "https://rustchain.org")
+RUSTCHAIN_API = os.getenv("RUSTCHAIN_API", os.getenv("RUSTCHAIN_API_BASE", "https://explorer.rustchain.org"))
+RTC_BALANCE_BASE = os.getenv("RTC_BALANCE_BASE", "https://50.28.86.131")
 WRTC_MINT = "12TAdKXxcGf6oCv4rqDz2NkgxjyHq6HQKoxKZYGf5i4X"
 DEXSCREENER_URL = f"https://api.dexscreener.com/latest/dex/tokens/{WRTC_MINT}"
 
@@ -71,6 +72,26 @@ async def _get_json(url: str, params: dict | None = None, *, verify_ssl: bool = 
 async def fetch_rustchain(path: str, params: dict | None = None):
     """Fetch from RustChain node (self-signed cert → ssl=False)."""
     return await _get_json(f"{RUSTCHAIN_API}{path}", params, verify_ssl=False)
+
+
+async def fetch_balance(wallet: str):
+    """Fetch wallet balance, supporting both legacy and current node paths."""
+    try:
+        return await _get_json(f"{RTC_BALANCE_BASE}/balance/{wallet}", verify_ssl=False)
+    except Exception:
+        return await _get_json(
+            f"{RTC_BALANCE_BASE}/wallet/balance",
+            {"miner_id": wallet},
+            verify_ssl=False,
+        )
+
+
+def normalize_miners(payload) -> list[dict]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict) and isinstance(payload.get("miners"), list):
+        return payload["miners"]
+    return []
 
 
 async def fetch_price_data() -> dict | None:
@@ -132,8 +153,9 @@ async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_miners(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
-        miners = await fetch_rustchain("/api/miners")
-        if not isinstance(miners, list):
+        miners_payload = await fetch_rustchain("/api/miners")
+        miners = normalize_miners(miners_payload)
+        if not miners:
             await update.message.reply_text("Unexpected response from /api/miners.")
             return
         lines = [f"*Active Miners: {len(miners)}*\n"]
@@ -175,16 +197,16 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     wallet = ctx.args[0]
     try:
-        data = await fetch_rustchain("/wallet/balance", {"miner_id": wallet})
-        if not data.get("ok"):
+        data = await fetch_balance(wallet)
+        if data.get("ok") is False:
             await update.message.reply_text(
                 f"Wallet `{wallet}` not found.", parse_mode="Markdown"
             )
             return
         text = (
             f"*Wallet Balance*\n\n"
-            f"Wallet: `{data.get('miner_id', wallet)}`\n"
-            f"Balance: `{data.get('amount_rtc', 0)} RTC`"
+            f"Wallet: `{data.get('miner_id', data.get('wallet', wallet))}`\n"
+            f"Balance: `{data.get('amount_rtc', data.get('balance', 0))} RTC`"
         )
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception as e:
@@ -241,8 +263,9 @@ async def mining_alert_loop(app: Application):
     await asyncio.sleep(5)
     while True:
         try:
-            miners = await fetch_rustchain("/api/miners")
-            if isinstance(miners, list):
+            miners_payload = await fetch_rustchain("/api/miners")
+            miners = normalize_miners(miners_payload)
+            if miners:
                 current = {m.get("miner", "") for m in miners}
                 if _last_known_miners:
                     for name in current - _last_known_miners:
@@ -335,8 +358,9 @@ async def inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not query or "miners" in query:
         try:
-            miners = await fetch_rustchain("/api/miners")
-            count = len(miners) if isinstance(miners, list) else "?"
+            miners_payload = await fetch_rustchain("/api/miners")
+            miners = normalize_miners(miners_payload)
+            count = len(miners) if miners else "?"
             results.append(
                 InlineQueryResultArticle(
                     id="miners",
